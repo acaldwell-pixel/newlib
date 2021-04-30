@@ -384,7 +384,7 @@ struct mq_hdr
 struct msg_hdr
 {
   int32_t         msg_next;	 /* index of next on linked list */
-  int32_t         msg_len;	 /* actual length */
+  uint32_t        msg_len;	 /* actual length */
   unsigned int    msg_prio;	 /* priority */
 };
 #pragma pack (pop)
@@ -814,7 +814,7 @@ _mq_send (mqd_t mqd, const char *ptr, size_t len, unsigned int prio,
 	  __leave;
 	}
       ipc_mutex_locked = true;
-      if (len > (size_t) attr->mq_msgsize)
+      if (len > attr->mq_msgsize)
 	{
 	  set_errno (EMSGSIZE);
 	  __leave;
@@ -911,7 +911,7 @@ mq_timedsend (mqd_t mqd, const char *ptr, size_t len, unsigned int prio,
 
 static ssize_t
 _mq_receive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop,
-	     const struct timespec *abstime)
+	     const struct timespec *abstime, uint32_t flags)
 {
   int n;
   long index;
@@ -922,6 +922,7 @@ _mq_receive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop,
   struct msg_hdr *msghdr;
   struct mq_info *mqinfo = (struct mq_info *) mqd;
   bool ipc_mutex_locked = false;
+  bool keep_packet = flags & (_MQ_PEEK | _MQ_PEEK_NONBLOCK);
 
   pthread_testcancel ();
 
@@ -941,14 +942,18 @@ _mq_receive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop,
 	  __leave;
 	}
       ipc_mutex_locked = true;
-      if (maxlen < (size_t) attr->mq_msgsize)
+
+      /* Check if maxlen is too small.  When called from _mq_recv, that's ok,
+	 but for actual user space message queues, that's an error condition */
+      if (maxlen < (size_t) attr->mq_msgsize && !(flags & _MQ_ALLOW_PARTIAL))
 	{
 	  set_errno (EMSGSIZE);
 	  __leave;
 	}
       if (attr->mq_curmsgs == 0)	/* queue is empty */
 	{
-	  if (mqinfo->mqi_flags & O_NONBLOCK)
+	  /* Don't block if O_NONBLOCK is set or when peeking w/o blocking */
+	  if ((mqinfo->mqi_flags & O_NONBLOCK) || (flags & _MQ_PEEK_NONBLOCK))
 	    {
 	      set_errno (EAGAIN);
 	      __leave;
@@ -972,39 +977,83 @@ _mq_receive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop,
 	api_fatal ("mq_receive: curmsgs = %ld; head = 0", attr->mq_curmsgs);
 
       msghdr = (struct msg_hdr *) &mptr[index];
-      mqhdr->mqh_head = msghdr->msg_next;     /* new head of list */
-      len = msghdr->msg_len;
-      memcpy(ptr, msghdr + 1, len);           /* copy the message itself */
+
+      /* Partial read? */
+      if (maxlen < msghdr->msg_len)
+	len = maxlen;
+      else
+	len = msghdr->msg_len;
+      memcpy(ptr, msghdr + 1, len);		/* copy the message itself */
       if (priop != NULL)
-	*priop = msghdr->msg_prio;
+	*priop = msghdr->msg_prio;		/* return priority */
 
-      /* Just-read message goes to front of free list */
-      msghdr->msg_next = mqhdr->mqh_free;
-      mqhdr->mqh_free = index;
+      if (!keep_packet)
+	{
+	  mqhdr->mqh_head = msghdr->msg_next;     /* new head of list */
+	  /* Just-read message goes to front of free list */
+	  msghdr->msg_next = mqhdr->mqh_free;
+	  mqhdr->mqh_free = index;
 
-      /* Wake up anyone blocked in mq_send waiting for room */
-      if (attr->mq_curmsgs == attr->mq_maxmsg)
-	ipc_cond_signal (mqinfo->mqi_waitsend);
-      attr->mq_curmsgs--;
+	  /* Wake up anyone blocked in mq_send waiting for room */
+	  if (attr->mq_curmsgs == attr->mq_maxmsg)
+	    ipc_cond_signal (mqinfo->mqi_waitsend);
+	  attr->mq_curmsgs--;
+	}
     }
   __except (EBADF) {}
   __endtry
-  if (ipc_mutex_locked)
+  if (ipc_mutex_locked && !(flags & _MQ_HOLD_LOCK))
     ipc_mutex_unlock (mqinfo->mqi_lock);
   return len;
+}
+
+/* Internal function to allow reading partial message packets.
+   Used from AF_UNIX code. */
+extern "C" ssize_t
+_mq_recv (mqd_t mqd, char *ptr, size_t maxlen, int flags)
+{
+  return _mq_receive (mqd, ptr, maxlen, NULL, NULL, _MQ_ALLOW_PARTIAL | flags);
+}
+
+/* Internal function to allow reading partial message packets with timeout.
+   Used from AF_UNIX code. */
+extern "C" ssize_t
+_mq_timedrecv (mqd_t mqd, char *ptr, size_t maxlen,
+	       const struct timespec *abstime, int flags)
+{
+  return _mq_receive (mqd, ptr, maxlen, NULL, abstime, _MQ_ALLOW_PARTIAL | flags);
+}
+
+/* Internal function to allow peeking into message packets.
+   Used from AF_UNIX code. */
+extern "C" ssize_t
+_mq_peek (mqd_t mqd, char *ptr, size_t maxlen, bool nonblocking)
+{
+  int flags = _MQ_ALLOW_PARTIAL | (nonblocking ? _MQ_PEEK_NONBLOCK : _MQ_PEEK);
+  return _mq_receive (mqd, ptr, maxlen, NULL, NULL, flags);
+}
+
+/* Internal function to unlock a queue after mq_receive was called
+   with _MQ_HOLD_LOCK.  Used from AF_UNIX code. */
+extern "C" void
+_mq_unlock (mqd_t mqd)
+{
+  struct mq_info *mqinfo = (struct mq_info *) mqd;
+
+  ipc_mutex_unlock (mqinfo->mqi_lock);
 }
 
 extern "C" ssize_t
 mq_receive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop)
 {
-  return _mq_receive (mqd, ptr, maxlen, priop, NULL);
+  return _mq_receive (mqd, ptr, maxlen, priop, NULL, 0);
 }
 
 extern "C" ssize_t
 mq_timedreceive (mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop,
 		 const struct timespec *abstime)
 {
-  return _mq_receive (mqd, ptr, maxlen, priop, abstime);
+  return _mq_receive (mqd, ptr, maxlen, priop, abstime, 0);
 }
 
 extern "C" int
