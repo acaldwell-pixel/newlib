@@ -118,9 +118,11 @@ esac
 case "${host_cpu}" in
   i[3-7]86-*-astraeaos*)
 	sys_dir=astraeaos
+	newlib_cflags="${newlib_cflags} -DMISSING_SYSCALL_NAMES -D__DYNAMIC_REENT__ -DHAVE_NANOSLEEP -D__NETBSD_SYSCALLS -D_ELIX_LEVEL=3 -O0 -gstabs+"
 	;;
   x86_64-*-astraeaos*)
 	sys_dir=x86_64
+	newlib_cflags="${newlib_cflags} -DMISSING_SYSCALL_NAMES -D__DYNAMIC_REENT__ -DHAVE_NANOSLEEP -D__NETBSD_SYSCALLS -D_ELIX_LEVEL=3 -O0 -gstabs+"
 	;;
   a29k)
 	machine_dir=a29k
