@@ -116,6 +116,12 @@ esac
 # THIS TABLE IS ALPHA SORTED.  KEEP IT THAT WAY.
 
 case "${host_cpu}" in
+  i[3-7]86-*-astraeaos*)
+	sys_dir=astraeaos
+	;;
+  x86_64-*-astraeaos*)
+	sys_dir=x86_64
+	;;
   a29k)
 	machine_dir=a29k
 	;;
